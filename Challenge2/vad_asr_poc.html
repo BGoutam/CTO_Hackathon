@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<!--
+  Client-Side VAD & Speech Recognition — Proof of Concept (Claude_version)
+  ------------------------------------------------------------------------
+  HOW TO RUN: open over a secure context — https:// or http://localhost — because
+  getUserMedia (microphone) is blocked on plain file://. Easiest local server:
+      python -m http.server 8000     →     http://localhost:8000/vad_asr_poc.html
+  Then click the mic and allow microphone access.
+
+  WHAT IT DEMONSTRATES:
+    • Silero VAD v5 (ONNX, on-device) with a guaranteed energy-VAD fallback
+    • Correct audio plumbing: resample to 16 kHz + slice EXACT 512-sample frames
+    • Speech start (P>0.5 for 2 frames) / end (P<0.35 for the silence timeout) with hysteresis
+    • Adaptive noise floor, live meters + oscilloscope
+    • ASR via Web Speech API, spoken reply (TTS), and live BARGE-IN
+    • Live latency readouts + an adjustable silence-timeout slider
+
+  KEY FIXES vs. the original PoC:
+    • Original used createScriptProcessor(1536,…) — INVALID (must be a power of two) → it crashed on start.
+    • Original used Silero's deprecated v3/v4 h/c interface + 1536-sample input — wrong for the current v5 model.
+    • This version uses a 2048 (power-of-two) block, resamples, and feeds Silero v5's required 512-sample frames.
+
+  NOTE ON "CLIENT-SIDE": the VAD is 100% on-device. The Web Speech API used here for ASR is
+  cloud-based in Chrome (audio goes to Google). For a strict no-server guarantee, swap in
+  transformers.js/Whisper (see the Technical Design Document). This is labelled in the UI.
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Browser VAD & Speech Recognition — PoC</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Space+Grotesk:wght@400;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: rgba(22, 29, 49, 0.7);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --accent-cyan: #00f2fe;
+            --accent-purple: #9b51e0;
+            --accent-green: #2ecc71;
+            --accent-red: #ff4757;
+            --text-main: #f1f2f6;
+            --text-muted: #a4b0be;
+            --glow-cyan: rgba(0, 242, 254, 0.4);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Outfit', sans-serif;
+            min-height: 100vh;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            padding: 24px; overflow-x: hidden;
+            background-image: radial-gradient(circle at 10% 20%, rgba(90, 120, 250, 0.06) 0%, transparent 42%),
+                              radial-gradient(circle at 90% 80%, rgba(155, 81, 224, 0.06) 0%, transparent 42%);
+        }
+        .container { width: 100%; max-width: 940px; display: grid; grid-template-columns: 1fr; gap: 22px; }
+        header { text-align: center; margin-bottom: 4px; }
+        h1 {
+            font-family: 'Space Grotesk', sans-serif; font-size: 2.2rem; font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+            margin-bottom: 6px; letter-spacing: -0.5px;
+        }
+        p.subtitle { color: var(--text-muted); font-size: 1rem; }
+        .card {
+            background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 20px;
+            padding: 24px; backdrop-filter: blur(16px); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+        .main-control-panel { display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center; }
+
+        /* Mic button */
+        .mic-btn-container { position: relative; width: 120px; height: 120px; margin: 6px 0; }
+        .mic-btn {
+            position: absolute; top: 10px; left: 10px; width: 100px; height: 100px; border-radius: 50%;
+            background: linear-gradient(135deg, #1e293b, #0f172a); border: 2px solid var(--border-color);
+            color: var(--text-main); font-size: 2rem; cursor: pointer; display: flex; align-items: center; justify-content: center;
+            outline: none; transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); z-index: 2;
+        }
+        .mic-btn:hover:not(:disabled) { transform: scale(1.05); border-color: var(--accent-cyan); }
+        .mic-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .mic-btn.active { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple)); border-color: transparent; box-shadow: 0 0 30px var(--glow-cyan); }
+        .mic-pulse { position: absolute; top: 0; left: 0; width: 120px; height: 120px; border-radius: 50%; border: 2px solid var(--accent-cyan); opacity: 0; pointer-events: none; z-index: 1; }
+        .mic-btn.active + .mic-pulse { animation: pulse 1.8s infinite cubic-bezier(0.215, 0.610, 0.355, 1); }
+        @keyframes pulse { 0% { transform: scale(0.8); opacity: 0.8; } 100% { transform: scale(1.3); opacity: 0; } }
+
+        /* Status badge */
+        .status-container { display: flex; align-items: center; gap: 12px; }
+        .status-badge {
+            padding: 6px 16px; border-radius: 50px; font-size: 0.85rem; font-weight: 600; text-transform: uppercase;
+            letter-spacing: 1px; background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); transition: all 0.3s ease;
+        }
+        .status-badge.idle { color: var(--text-muted); }
+        .status-badge.listening { color: var(--accent-cyan); border-color: var(--accent-cyan); box-shadow: 0 0 10px rgba(0,242,254,0.2); }
+        .status-badge.speaking { color: var(--accent-green); border-color: var(--accent-green); box-shadow: 0 0 10px rgba(46,204,113,0.2); }
+        .status-badge.processing { color: var(--accent-purple); border-color: var(--accent-purple); box-shadow: 0 0 10px rgba(155,81,224,0.2); }
+        .status-badge.assistant { color: #ffb142; border-color: #ffb142; box-shadow: 0 0 10px rgba(255,177,66,0.2); }
+
+        /* State machine pills */
+        .state-flow { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+        .state-pill {
+            font-size: 0.68rem; letter-spacing: 0.5px; text-transform: uppercase; padding: 4px 10px; border-radius: 50px;
+            background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); color: var(--text-muted); transition: all 0.25s ease;
+        }
+        .state-pill.active { color: #fff; border-color: var(--accent-cyan); background: rgba(0,242,254,0.12); box-shadow: 0 0 10px rgba(0,242,254,0.2); }
+
+        /* Meters */
+        .meters-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; width: 100%; margin-top: 6px; }
+        @media (max-width: 600px) { .meters-grid { grid-template-columns: 1fr; } }
+        .meter-container { display: flex; flex-direction: column; gap: 8px; text-align: left; }
+        .meter-label { font-size: 0.85rem; color: var(--text-muted); display: flex; justify-content: space-between; }
+        .meter-bar-outer { height: 12px; background: rgba(0,0,0,0.2); border-radius: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05); }
+        .meter-bar-inner { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple)); transition: width 0.08s linear; box-shadow: 0 0 8px var(--glow-cyan); }
+        canvas.visualizer { width: 100%; height: 80px; background: rgba(0,0,0,0.25); border-radius: 12px; border: 1px solid var(--border-color); display:block; }
+
+        /* Controls row */
+        .controls-row { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; align-items: center; margin-top: 4px; font-size: 0.85rem; }
+        .toggle-option { display: flex; align-items: center; gap: 6px; color: var(--text-muted); cursor: pointer; }
+        .toggle-option input { cursor: pointer; }
+        .slider-box { display: flex; align-items: center; gap: 10px; color: var(--text-muted); }
+        .slider-box input[type=range] { accent-color: var(--accent-cyan); }
+        .slider-box b { color: var(--accent-cyan); min-width: 54px; text-align: right; }
+
+        /* Latency panel */
+        .latency-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; width: 100%; }
+        .lat-stat { background: rgba(0,0,0,0.18); border: 1px solid var(--border-color); border-radius: 12px; padding: 12px 14px; text-align: center; }
+        .lat-stat .val { font-family: 'Space Grotesk', sans-serif; font-size: 1.5rem; color: var(--accent-cyan); }
+        .lat-stat .lbl { font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+
+        /* Output */
+        .display-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 22px; }
+        @media (max-width: 768px) { .display-grid { grid-template-columns: 1fr; } }
+        .output-box, .console-box { display: flex; flex-direction: column; gap: 12px; min-height: 260px; }
+        .output-box h3, .console-box h3 { font-family: 'Space Grotesk', sans-serif; font-size: 1.1rem; border-bottom: 1px solid var(--border-color); padding-bottom: 8px; display:flex; justify-content:space-between; align-items:center; }
+        .badge-note { font-size: 0.62rem; font-weight: 400; color: #ffb142; border: 1px solid rgba(255,177,66,0.4); border-radius: 50px; padding: 2px 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .transcript-content { flex: 1; background: rgba(0,0,0,0.15); border-radius: 12px; padding: 16px; font-size: 1rem; line-height: 1.6; overflow-y: auto; border: 1px solid rgba(255,255,255,0.03); }
+        .turn { padding: 8px 12px; margin-bottom: 8px; background: rgba(0,242,254,0.06); border-left: 3px solid var(--accent-cyan); border-radius: 6px; }
+        .turn .meta { font-size: 0.7rem; color: var(--text-muted); }
+        .placeholder { color: var(--text-muted); }
+        .log-terminal { flex: 1; background: #05070c; border-radius: 12px; padding: 12px; font-family: 'Consolas','Courier New',monospace; font-size: 0.78rem; color: #00ff66; overflow-y: auto; border: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 5px; max-height: 320px; }
+        .log-entry { display: flex; gap: 8px; }
+        .log-entry .timestamp { color: #57606f; flex-shrink: 0; }
+        .log-entry .info { color: var(--accent-cyan); }
+        .log-entry .success { color: var(--accent-green); }
+        .log-entry .warn { color: #ffb142; }
+        .log-entry .err { color: var(--accent-red); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>VAD &amp; Speech Recognition</h1>
+            <p class="subtitle">Client-Side Conversational Voice Pipeline — Silero VAD v5 + ASR + Barge-in</p>
+        </header>
+
+        <!-- Main controller -->
+        <div class="card main-control-panel">
+            <div class="mic-btn-container">
+                <button class="mic-btn" id="micBtn" disabled>🎙️</button>
+                <div class="mic-pulse"></div>
+            </div>
+
+            <div class="status-container">
+                <span class="status-badge idle" id="statusBadge">Loading engine…</span>
+            </div>
+
+            <!-- State machine flow -->
+            <div class="state-flow">
+                <span class="state-pill" data-state="IDLE">Idle</span>
+                <span class="state-pill" data-state="LISTENING">Listening</span>
+                <span class="state-pill" data-state="USER_SPEAKING">User Speaking</span>
+                <span class="state-pill" data-state="TRANSCRIBING">Transcribing</span>
+                <span class="state-pill" data-state="ASSISTANT_SPEAKING">Assistant Speaking</span>
+            </div>
+
+            <div id="liveInfo" style="font-size:0.78rem; color: var(--text-muted); font-family:'Consolas',monospace;">— click the mic and speak —</div>
+
+            <!-- Controls -->
+            <div class="controls-row">
+                <label class="toggle-option"><input type="checkbox" id="useOnnxVad"> Silero VAD (ONNX) — optional</label>
+                <label class="toggle-option"><input type="checkbox" id="enableBargeIn" checked> TTS Barge-in</label>
+                <label class="toggle-option"><input type="checkbox" id="enableTts" checked> Speak reply (TTS)</label>
+                <div class="slider-box">
+                    Silence timeout <input type="range" id="silenceSlider" min="300" max="2500" step="50" value="1000"> <b id="silenceVal">1000 ms</b>
+                </div>
+            </div>
+
+            <!-- Meters -->
+            <div class="meters-grid">
+                <div class="meter-container">
+                    <div class="meter-label"><span>Speech Probability (VAD)</span><span id="vadVal">0%</span></div>
+                    <div class="meter-bar-outer"><div class="meter-bar-inner" id="vadProgress"></div></div>
+                    <canvas class="visualizer" id="visualizerCanvas"></canvas>
+                </div>
+                <div class="meter-container">
+                    <div class="meter-label"><span>Audio Energy (RMS)</span><span id="energyVal">0.000</span></div>
+                    <div class="meter-bar-outer"><div class="meter-bar-inner" id="energyProgress" style="background: var(--accent-cyan);"></div></div>
+                    <div class="latency-grid" style="margin-top:6px;">
+                        <div class="lat-stat"><div class="val" id="detectLat">– ms</div><div class="lbl">Detection debounce</div></div>
+                        <div class="lat-stat"><div class="val" id="transcriptLat">– ms</div><div class="lbl">End→Transcript</div></div>
+                    </div>
+                    <div style="font-size:0.78rem; color: var(--text-muted); line-height: 1.4; margin-top:8px;">
+                        <strong>Fallback:</strong> if the Silero model can't load (offline/CORS), the pipeline auto-switches to an RMS energy VAD so the demo always runs.
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Output -->
+        <div class="display-grid">
+            <div class="card output-box">
+                <h3>Conversation <span class="badge-note" id="asrNote">ASR: —</span></h3>
+                <div class="transcript-content" id="transcriptContent"><span class="placeholder">System ready. Click the microphone to start a session.</span></div>
+            </div>
+            <div class="card console-box">
+                <h3>Pipeline Engine Logs</h3>
+                <div class="log-terminal" id="logTerminal">
+                    <div class="log-entry"><span class="timestamp">[00:00:00]</span><span>System initializing…</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        /* ============================ State ============================ */
+        let isRecording = false;
+        let audioContext = null, mediaStream = null, sourceNode = null, filterNode = null, processorNode = null, muteNode = null, analyserNode = null;
+        let ctxSampleRate = 16000;
+
+        // ASR
+        let recognition = null, asrRunning = false, asrSupported = false, sessionTranscript = '';
+
+        // Silero VAD (ONNX v5)
+        let onnxSession = null, sileroReady = false, sileroState = null;
+        let inName = {}, outName = {}, srDims = [];
+
+        // VAD tuning
+        let SILENCE_TIMEOUT_MS = 1000;
+        const START_THRESHOLD = 0.50, END_THRESHOLD = 0.35, START_FRAMES = 2;
+        let speechFrameCount = 0, userSpeaking = false, lastSpeechTime = 0, onsetCandidateTime = 0, noiseFloorEMA = 0;
+        let rmsFloor = 0.015, sileroFailed = false;   // adaptive ambient-noise floor + Silero inference-health flag
+        let sileroProbMin = 1, sileroProbMax = 0, sileroFrames = 0;   // Silero "is it stuck?" monitor
+        let probEnv = 0;   // smoothed speech-probability envelope (bridges gaps between fast words)
+
+        // Conversation state machine
+        let state = 'IDLE';
+        let speechEndTime = 0, assistantStartTime = 0;
+
+        // Frame pipeline (decouples audio block size from Silero's fixed 512)
+        let carry = new Float32Array(0);
+        let frameQueue = [], processing = false;
+
+        /* ============================ DOM ============================ */
+        const micBtn = document.getElementById('micBtn');
+        const statusBadge = document.getElementById('statusBadge');
+        const vadProgress = document.getElementById('vadProgress');
+        const vadVal = document.getElementById('vadVal');
+        const energyProgress = document.getElementById('energyProgress');
+        const energyVal = document.getElementById('energyVal');
+        const transcriptContent = document.getElementById('transcriptContent');
+        const logTerminal = document.getElementById('logTerminal');
+        const canvas = document.getElementById('visualizerCanvas');
+        const canvasCtx = canvas.getContext('2d');
+        const useOnnxVadCheckbox = document.getElementById('useOnnxVad');
+        const enableBargeIn = document.getElementById('enableBargeIn');
+        const enableTts = document.getElementById('enableTts');
+        const silenceSlider = document.getElementById('silenceSlider');
+        const silenceVal = document.getElementById('silenceVal');
+        const detectLat = document.getElementById('detectLat');
+        const transcriptLat = document.getElementById('transcriptLat');
+        const asrNote = document.getElementById('asrNote');
+        const liveInfo = document.getElementById('liveInfo');
+
+        /* ============================ Utilities ============================ */
+        function log(message, type = 'info') {
+            const timeStr = new Date().toTimeString().split(' ')[0];
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="timestamp">[${timeStr}]</span><span class="${type}">${message}</span>`;
+            logTerminal.appendChild(entry);
+            logTerminal.scrollTop = logTerminal.scrollHeight;
+        }
+
+        const STATE_MAP = {
+            IDLE: ['Idle', 'idle'], LISTENING: ['Listening…', 'listening'], USER_SPEAKING: ['User Speaking', 'speaking'],
+            TRANSCRIBING: ['Transcribing…', 'processing'], PROCESSING: ['Processing…', 'processing'], ASSISTANT_SPEAKING: ['Assistant Speaking', 'assistant']
+        };
+        function setState(s) {
+            state = s;
+            const [txt, cls] = STATE_MAP[s] || ['Idle', 'idle'];
+            statusBadge.innerText = txt;
+            statusBadge.className = 'status-badge ' + cls;
+            document.querySelectorAll('.state-pill').forEach(p => p.classList.toggle('active', p.dataset.state === s || (s === 'PROCESSING' && p.dataset.state === 'TRANSCRIBING')));
+        }
+
+        // Energy VAD: speech must rise a margin ABOVE the learned ambient RMS floor,
+        // so a steady fan / AC / mic hiss reads as silence rather than constant speech.
+        function energyProb(rms) {
+            const gate = rmsFloor + 0.012;
+            return Math.min(1, Math.max(0, (rms - gate) * 40));
+        }
+
+        // Linear resampler to 16 kHz (identity when already 16 kHz).
+        function resampleTo16k(input, inRate) {
+            if (inRate === 16000) return input;
+            const ratio = 16000 / inRate;
+            const outLen = Math.max(1, Math.round(input.length * ratio));
+            const out = new Float32Array(outLen);
+            for (let i = 0; i < outLen; i++) {
+                const srcPos = i / ratio;
+                const i0 = Math.floor(srcPos);
+                const i1 = Math.min(i0 + 1, input.length - 1);
+                out[i] = input[i0] * (1 - (srcPos - i0)) + input[i1] * (srcPos - i0);
+            }
+            return out;
+        }
+
+        function sizeCanvas() {
+            const r = canvas.getBoundingClientRect();
+            canvas.width = Math.max(1, Math.floor(r.width));
+            canvas.height = Math.max(1, Math.floor(r.height));
+        }
+
+        /* ============================ ONNX (Silero VAD v5) ============================ */
+        async function initOnnx() {
+            log('Loading Silero VAD v5 (ONNX, ~1.3–2.3 MB)…');
+            try {
+                ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/';
+                // Single-threaded on purpose: multi-threaded WASM needs SharedArrayBuffer, which
+                // requires COOP/COEP headers that a plain `python -m http.server` does NOT send.
+                // Forcing 1 thread lets the model load on any static server. SIMD needs no headers.
+                ort.env.wasm.numThreads = 1;
+                ort.env.wasm.simd = true;
+
+                const modelUrl = 'https://cdn.jsdelivr.net/gh/snakers4/silero-vad@master/src/silero_vad/data/silero_vad.onnx';
+                onnxSession = await ort.InferenceSession.create(modelUrl, { executionProviders: ['wasm'] });
+
+                // Map tensor names robustly across model builds (v5 = input/state/sr → output/stateN).
+                const ins = onnxSession.inputNames, outs = onnxSession.outputNames;
+                inName.state = ins.find(n => /state|hidden/i.test(n));
+                inName.sr = ins.find(n => /^sr$|sample|rate/i.test(n));
+                inName.audio = ins.find(n => n !== inName.state && n !== inName.sr) || ins[0];
+                outName.state = outs.find(n => /state|hn|cn/i.test(n));
+                outName.prob = outs.find(n => n !== outName.state) || outs[0];
+
+                if (!inName.state) throw new Error('Model is not the Silero v5 single-state interface.');
+                sileroState = new Float32Array(2 * 1 * 128).fill(0);
+                sileroReady = true;
+                log('Silero VAD v5 loaded — on-device neural VAD active.', 'success');
+            } catch (err) {
+                log('Silero model unavailable (' + (err.message || err) + ').', 'warn');
+                log('Falling back to RMS energy VAD — demo still fully functional.', 'success');
+                sileroReady = false;
+                useOnnxVadCheckbox.checked = false;
+                useOnnxVadCheckbox.disabled = true;
+            } finally {
+                statusBadge.innerText = 'Ready to Record';
+                micBtn.disabled = false;
+            }
+        }
+
+        async function runSilero(frame) {
+            const feeds = {};
+            feeds[inName.audio] = new ort.Tensor('float32', frame, [1, 512]);
+            feeds[inName.state] = new ort.Tensor('float32', sileroState, [2, 1, 128]);
+            feeds[inName.sr] = new ort.Tensor('int64', new BigInt64Array([16000n]), srDims);
+            let res;
+            try {
+                res = await onnxSession.run(feeds);
+            } catch (e) {
+                if (srDims.length === 0) { srDims = [1]; return runSilero(frame); }  // retry sr shape once
+                throw e;
+            }
+            sileroState = Float32Array.from(res[outName.state].data);
+            return res[outName.prob].data[0];
+        }
+
+        /* ============================ ASR (Web Speech API) ============================ */
+        function initASR() {
+            const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SR) { asrSupported = false; asrNote.innerText = 'ASR: unavailable (VAD-only)'; log('Web Speech API not supported — running VAD-only.', 'warn'); return; }
+            asrSupported = true;
+            asrNote.innerText = 'ASR: Web Speech (Chrome→cloud)';
+            recognition = new SR();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = 'en-IN'; // Indian English locale
+
+            recognition.onstart = () => { asrRunning = true; };
+            recognition.onresult = (event) => {
+                let interim = '';
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    const t = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) sessionTranscript += t; else interim += t;
+                }
+                if (interim && state === 'USER_SPEAKING') showInterim(sessionTranscript + interim);
+            };
+            recognition.onerror = (e) => { if (e.error !== 'no-speech' && e.error !== 'aborted') log('ASR error: ' + e.error, 'warn'); };
+            recognition.onend = () => {
+                asrRunning = false;
+                if (state === 'TRANSCRIBING' || state === 'PROCESSING') { const t = sessionTranscript; sessionTranscript = ''; finalizeTurn(t); }
+                else if (userSpeaking && isRecording) { try { recognition.start(); } catch (e) {} log('ASR session refreshed (long-utterance handling).', 'info'); }
+            };
+        }
+        function startASR() { if (!asrSupported || asrRunning) return; sessionTranscript = ''; try { recognition.start(); } catch (e) {} }
+        function stopASR() { if (asrSupported && asrRunning) { try { recognition.stop(); } catch (e) {} } else { finalizeTurn(sessionTranscript); sessionTranscript = ''; } }
+
+        /* ============================ Turn finalization + TTS ============================ */
+        let interimEl = null;
+        function showInterim(text) {
+            if (transcriptContent.querySelector('.placeholder')) transcriptContent.innerHTML = '';
+            if (!interimEl) { interimEl = document.createElement('div'); interimEl.className = 'turn'; interimEl.style.opacity = '0.6'; transcriptContent.appendChild(interimEl); }
+            interimEl.innerHTML = `<div class="meta">…listening</div>${text}`;
+            transcriptContent.scrollTop = transcriptContent.scrollHeight;
+        }
+        function appendTurn(text) {
+            if (interimEl) { interimEl.remove(); interimEl = null; }
+            if (transcriptContent.querySelector('.placeholder')) transcriptContent.innerHTML = '';
+            const div = document.createElement('div');
+            div.className = 'turn';
+            div.innerHTML = `<div class="meta">You</div>${text}`;
+            transcriptContent.appendChild(div);
+            transcriptContent.scrollTop = transcriptContent.scrollHeight;
+        }
+        function finalizeTurn(text) {
+            if (interimEl) { interimEl.remove(); interimEl = null; }
+            transcriptLat.innerText = Math.round(performance.now() - speechEndTime) + ' ms';
+            text = (text || '').trim();
+            if (text) { appendTurn(text); log('ASR final: "' + text + '"', 'success'); speakReply(text); }
+            else { log('Empty transcript (noise/click) — back to listening.', 'info'); if (isRecording) setState('LISTENING'); }
+        }
+        function speakReply(text) {
+            if (!enableTts.checked || !('speechSynthesis' in window)) { if (isRecording) setState('LISTENING'); return; }
+            setState('ASSISTANT_SPEAKING');
+            assistantStartTime = performance.now();
+            const utt = new SpeechSynthesisUtterance('You said: ' + text);
+            utt.onend = () => { if (state === 'ASSISTANT_SPEAKING' && isRecording) setState('LISTENING'); };
+            log('Assistant speaking (say something to barge-in)…', 'info');
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(utt);
+        }
+        function bargeIn() { window.speechSynthesis.cancel(); log('⚡ Barge-in — assistant playback cancelled.', 'warn'); }
+
+        /* ============================ VAD state machine ============================ */
+        function handleVad(prob) {
+            const now = performance.now();
+            const startThresh = Math.max(START_THRESHOLD, noiseFloorEMA + 0.15);
+            if (!userSpeaking) {
+                if (prob > startThresh) {
+                    if (speechFrameCount === 0) onsetCandidateTime = now;
+                    speechFrameCount++;
+                    if (speechFrameCount >= START_FRAMES) onSpeechStart(now);
+                } else {
+                    speechFrameCount = 0;
+                    noiseFloorEMA = 0.995 * noiseFloorEMA + 0.005 * prob; // learn quiet baseline
+                }
+            } else {
+                if (prob > END_THRESHOLD) lastSpeechTime = now;      // hysteresis: lower bar to stay "speaking"
+                else if (now - lastSpeechTime > SILENCE_TIMEOUT_MS) onSpeechEnd(now);
+            }
+        }
+        function onSpeechStart(now) {
+            userSpeaking = true; speechFrameCount = 0; lastSpeechTime = now;
+            detectLat.innerText = Math.round(now - onsetCandidateTime) + ' ms';
+            if (state === 'ASSISTANT_SPEAKING' && enableBargeIn.checked && (now - assistantStartTime > 400)) bargeIn();
+            setState('USER_SPEAKING');
+            log('VAD: Speech Start', 'info');
+            startASR();
+        }
+        function onSpeechEnd(now) {
+            userSpeaking = false; speechEndTime = now;
+            setState('TRANSCRIBING');
+            log(`VAD: Speech End (${SILENCE_TIMEOUT_MS} ms silence)`, 'info');
+            stopASR();
+        }
+
+        /* ============================ Audio graph ============================ */
+        function enqueueFrame(frame) { frameQueue.push(frame); pumpQueue(); }
+        async function pumpQueue() {
+            if (processing) return;
+            processing = true;
+            while (frameQueue.length) { await processFrame(frameQueue.shift()); }
+            processing = false;
+        }
+        async function processFrame(frame) {
+            let sum = 0;
+            for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+            const rms = Math.sqrt(sum / frame.length);
+            // Learn the ambient noise floor while NOT actively speaking.
+            if (!userSpeaking) rmsFloor = 0.9 * rmsFloor + 0.1 * rms;
+            energyProgress.style.width = Math.min(100, rms * 400) + '%';
+            energyVal.innerText = rms.toFixed(3);
+
+            let prob, engine;
+            if (sileroReady && !sileroFailed && useOnnxVadCheckbox.checked) {
+                engine = 'Silero';
+                try { prob = await runSilero(frame); }
+                catch (err) {
+                    sileroFailed = true; useOnnxVadCheckbox.checked = false;
+                    log('Silero inference failed (' + (err.message || err) + ') — using energy VAD.', 'warn');
+                    prob = energyProb(rms); engine = 'Energy';
+                }
+                // Auto-fallback: if Silero is pinned to a constant non-zero value, it is stuck.
+                if (engine === 'Silero') {
+                    sileroFrames++;
+                    sileroProbMin = Math.min(sileroProbMin, prob);
+                    sileroProbMax = Math.max(sileroProbMax, prob);
+                    if (sileroFrames >= 60) {
+                        if (sileroProbMax - sileroProbMin < 0.03 && (sileroProbMin + sileroProbMax) / 2 > 0.2) {
+                            sileroFailed = true; useOnnxVadCheckbox.checked = false;
+                            log('Silero output looks stuck (~' + sileroProbMin.toFixed(2) + ') — switching to energy VAD.', 'warn');
+                        }
+                        sileroFrames = 0; sileroProbMin = 1; sileroProbMax = 0;
+                    }
+                }
+            } else {
+                engine = 'Energy';
+                prob = energyProb(rms);
+            }
+
+            // Fast-attack / slow-release envelope: short gaps between words don't read as silence,
+            // so a full/fast sentence stays a single utterance instead of ending after a few words.
+            probEnv = prob > probEnv ? (0.5 * probEnv + 0.5 * prob) : (0.90 * probEnv + 0.10 * prob);
+            prob = probEnv;
+
+            vadProgress.style.width = (prob * 100) + '%';
+            vadVal.innerText = Math.round(prob * 100) + '%';
+            if (liveInfo) liveInfo.innerText = `${engine} VAD  ·  RMS ${rms.toFixed(3)}  ·  floor ${rmsFloor.toFixed(3)}  ·  ${Math.round(prob * 100)}%`;
+            if (isRecording) handleVad(prob);
+        }
+        function feedSamples(chunk) {
+            const combined = new Float32Array(carry.length + chunk.length);
+            combined.set(carry, 0); combined.set(chunk, carry.length);
+            let off = 0;
+            while (combined.length - off >= 512) { enqueueFrame(combined.slice(off, off + 512)); off += 512; }
+            carry = combined.slice(off);
+        }
+
+        async function startAudio() {
+            try {
+                // Use the hardware-default rate (usually 48 kHz) — forcing a 16 kHz context can yield a
+                // silent/suspended stream in Chrome. We resample to 16 kHz downstream in feedSamples().
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioContext.state === 'suspended') await audioContext.resume();
+                ctxSampleRate = audioContext.sampleRate;
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
+                sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+                // Band-pass 300–3400 Hz (speech band)
+                filterNode = audioContext.createBiquadFilter();
+                filterNode.type = 'bandpass';
+                filterNode.frequency.value = 1850;   // center of 300–3400
+                filterNode.Q.value = 0.7;
+
+                // Visualizer taps the raw source
+                analyserNode = audioContext.createAnalyser();
+                analyserNode.fftSize = 512;
+                sourceNode.connect(analyserNode);
+
+                // 2048 is a VALID power-of-two block; we reslice to Silero's required 512 in feedSamples().
+                processorNode = audioContext.createScriptProcessor(2048, 1, 1);
+                muteNode = audioContext.createGain();
+                muteNode.gain.value = 0; // prevents hearing your own mic through the speakers
+
+                sourceNode.connect(filterNode);
+                filterNode.connect(processorNode);
+                processorNode.connect(muteNode);
+                muteNode.connect(audioContext.destination);
+
+                carry = new Float32Array(0); rmsFloor = 0.015; noiseFloorEMA = 0;
+                sileroFailed = false; sileroFrames = 0; sileroProbMin = 1; sileroProbMax = 0; probEnv = 0;
+                processorNode.onaudioprocess = (e) => {
+                    if (!isRecording) return;
+                    feedSamples(resampleTo16k(e.inputBuffer.getChannelData(0), ctxSampleRate));
+                };
+
+                log(`Audio graph active — context ${ctxSampleRate} Hz${ctxSampleRate !== 16000 ? ' (resampling to 16 kHz)' : ''}.`, 'success');
+                setState('LISTENING');
+                sizeCanvas();
+                drawWaveform();
+            } catch (err) {
+                log('Microphone error: ' + err.message, 'err');
+                statusBadge.innerText = 'Mic Blocked';
+                statusBadge.className = 'status-badge idle';
+                isRecording = false; micBtn.classList.remove('active');
+            }
+        }
+
+        function drawWaveform() {
+            if (!analyserNode || !isRecording) return;
+            requestAnimationFrame(drawWaveform);
+            const n = analyserNode.frequencyBinCount;
+            const data = new Uint8Array(n);
+            analyserNode.getByteTimeDomainData(data);
+            const w = canvas.width, h = canvas.height;
+            canvasCtx.fillStyle = '#05070c';
+            canvasCtx.fillRect(0, 0, w, h);
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeStyle = userSpeaking ? '#2ecc71' : '#00f2fe';
+            canvasCtx.beginPath();
+            const slice = w / n;
+            let x = 0;
+            for (let i = 0; i < n; i++) {
+                const v = data[i] / 128.0;
+                const y = (v * h) / 2;
+                i === 0 ? canvasCtx.moveTo(x, y) : canvasCtx.lineTo(x, y);
+                x += slice;
+            }
+            canvasCtx.lineTo(w, h / 2);
+            canvasCtx.stroke();
+        }
+
+        function stopAudio() {
+            isRecording = false;
+            if (asrRunning) { try { recognition.stop(); } catch (e) {} }
+            if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+            if (processorNode) { processorNode.disconnect(); processorNode.onaudioprocess = null; processorNode = null; }
+            if (filterNode) { filterNode.disconnect(); filterNode = null; }
+            if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+            if (analyserNode) { analyserNode.disconnect(); analyserNode = null; }
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            if (audioContext) { audioContext.close(); audioContext = null; }
+            userSpeaking = false; speechFrameCount = 0; frameQueue = []; processing = false; carry = new Float32Array(0);
+            vadProgress.style.width = '0%'; vadVal.innerText = '0%';
+            energyProgress.style.width = '0%'; energyVal.innerText = '0.000';
+            setState('IDLE'); statusBadge.innerText = 'Ready to Record';
+            log('Pipeline deactivated.', 'info');
+        }
+
+        /* ============================ Wiring ============================ */
+        micBtn.addEventListener('click', async () => {
+            if (!isRecording) {
+                isRecording = true;
+                micBtn.classList.add('active'); micBtn.innerText = '⏹️';
+                setState('LISTENING');
+                log('Activating voice pipeline…', 'info');
+                await startAudio();
+            } else {
+                micBtn.classList.remove('active'); micBtn.innerText = '🎙️';
+                stopAudio();
+                if (liveInfo) liveInfo.innerText = '— stopped · click the mic to start again —';
+            }
+        });
+        silenceSlider.addEventListener('input', () => { SILENCE_TIMEOUT_MS = parseInt(silenceSlider.value, 10); silenceVal.innerText = SILENCE_TIMEOUT_MS + ' ms'; });
+        window.addEventListener('resize', () => { if (isRecording) sizeCanvas(); });
+        window.addEventListener('DOMContentLoaded', () => { sizeCanvas(); initASR(); initOnnx(); });
+    </script>
+</body>
+</html>
