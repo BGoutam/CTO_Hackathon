@@ -1,1 +1,1 @@
-Challenge 1
+Repository for CTO Hackathon Challenge 1.
